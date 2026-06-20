@@ -27,6 +27,7 @@ MODEL_FILE = "GPEN-BFR-256.onnx"
 
 ENHANCER = None
 THREAD_LOCK = threading.Lock()
+_DOWNLOAD_FAILED = False  # prevent repeated retries on 404
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
@@ -35,11 +36,14 @@ models_dir = os.path.join(
 
 
 def pre_check() -> bool:
+    global _DOWNLOAD_FAILED
     model_path = os.path.join(models_dir, MODEL_FILE)
-    if not os.path.exists(model_path):
+    if not os.path.exists(model_path) and not _DOWNLOAD_FAILED:
         update_status(f"Downloading {MODEL_FILE}...", NAME)
         from modules.utilities import conditional_download
         conditional_download(models_dir, [MODEL_URL])
+        if not os.path.exists(model_path):
+            _DOWNLOAD_FAILED = True
     return True
 
 
@@ -51,13 +55,15 @@ def pre_start() -> bool:
 
 
 def get_enhancer() -> Any:
-    global ENHANCER
+    global ENHANCER, _DOWNLOAD_FAILED
     with THREAD_LOCK:
         if ENHANCER is None:
             model_path = os.path.join(models_dir, MODEL_FILE)
-            if not os.path.exists(model_path):
+            if not os.path.exists(model_path) and not _DOWNLOAD_FAILED:
                 from modules.utilities import conditional_download
                 conditional_download(models_dir, [MODEL_URL])
+                if not os.path.exists(model_path):
+                    _DOWNLOAD_FAILED = True
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model file not found: {model_path}")
             print(f"{NAME}: Loading ONNX model from {model_path}")
