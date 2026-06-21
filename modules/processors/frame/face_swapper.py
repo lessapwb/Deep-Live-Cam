@@ -8,7 +8,6 @@ import platform
 import modules.globals
 import modules.processors.frame.core
 from modules import imread_unicode, imwrite_unicode
-from modules.core import update_status
 from modules.face_analyser import get_one_face, get_many_faces, default_source_face
 from modules.typing import Face, Frame
 from modules.utilities import (
@@ -21,6 +20,11 @@ from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weigh
 import os
 from collections import deque
 import time
+
+
+def update_status(message: str, scope: str = "DLC.FACE-SWAPPER") -> None:
+    """Log sem importar o pesado modules.core/TensorFlow no modo ao vivo."""
+    print(f"[{scope}] {message}", flush=True)
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -276,8 +280,14 @@ def get_face_swapper() -> Any:
                     model_path,
                     providers=providers_config,
                 )
-                # Set up CUDA graph session for faster inference
-                if _HAS_TORCH_CUDA and any(
+                # CUDA Graph é opt-in. Em várias GPUs móveis/RTX 30xx, alguns
+                # nós do inswapper não podem ser capturados e invalidam o
+                # stream CUDA (erros 900/901). A sessão CUDA normal já mantém
+                # a aceleração sem esse risco.
+                enable_cuda_graph = os.environ.get(
+                    "DLC_ENABLE_CUDA_GRAPH", ""
+                ).strip() == "1"
+                if enable_cuda_graph and _HAS_TORCH_CUDA and any(
                     p == "CUDAExecutionProvider" or
                     (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
                     for p in providers_config

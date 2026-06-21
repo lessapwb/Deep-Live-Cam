@@ -7,7 +7,6 @@ import threading
 import modules.globals
 import modules.processors.frame.core
 from modules import imread_unicode, imwrite_unicode
-from modules.core import update_status
 from modules.face_analyser import get_one_face
 from modules.typing import Frame, Face
 from modules.utilities import (
@@ -22,7 +21,7 @@ from modules.processors.frame._onnx_enhancer import (
 
 NAME = "DLC.FACE-ENHANCER-GPEN512"
 INPUT_SIZE = 512
-MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-512.onnx"
+MODEL_URL = "https://huggingface.co/hacksider/deep-live-cam/resolve/main/GPEN-BFR-512.onnx"
 MODEL_FILE = "GPEN-BFR-512.onnx"
 
 ENHANCER = None
@@ -33,6 +32,10 @@ abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
 )
+
+
+def update_status(message: str, scope: str = NAME) -> None:
+    print(f"[{scope}] {message}", flush=True)
 
 
 def pre_check() -> bool:

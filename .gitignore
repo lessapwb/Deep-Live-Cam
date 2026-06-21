@@ -15,6 +15,7 @@ tf_env/
 temp/
 .venv/
 venv/
+.rvc-venv/
 env/
 workflow/
 gfpgan/

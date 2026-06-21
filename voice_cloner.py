@@ -1,28 +1,23 @@
 """
-Módulo de Clonagem de Voz com RVC (Retrieval-based Voice Conversion)
-====================================================================
-Permite usar uma amostra de voz famosa para converter a tua voz em tempo real.
+Voice Cloner — Clonagem de Voz com PyTorch Direto
+===================================================
+Carrega modelos RVC .pth diretamente com PyTorch + librosa.
+NÃO precisa de rvc-python / fairseq — compatível Python 3.13.
 
-Suporta dois modos:
-  1. RVC (Recomendado) — Usa modelos .pth/.index treinados para qualidade profissional
-  2. Efeitos simples — Fallback com pitch shift + formant shift
-
-Fluxo típico:
-  1. Arranja um modelo RVC pré-treinado da voz desejada (HuggingFace, Discord RVC)
-  2. Coloca os ficheiros .pth e .index na pasta models/rvc/
-  3. Executa: python run_voice_avatar.py --voice-model modelos/rvc/meu_modelo
-
-OU usa efeitos simples sem precisar de modelo:
-  python run_voice_avatar.py --voice-effect deep
+Uso:
+    cloner = VoiceCloner()
+    cloner.load_model("models/rvc/Lula")
+    cloner.start()
 """
 
 import os
 import sys
 import threading
 import time
-import subprocess
+import shutil
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Callable
+from collections import OrderedDict
 
 import numpy as np
 
@@ -30,413 +25,345 @@ import numpy as np
 # Constantes
 # ---------------------------------------------------------------------------
 RATE = 44100
+HOP = 512
 CHUNK = 1024
-HAS_RVC = False
+DEVICE = "cuda" if os.environ.get("RVC_CPU", "") != "1" else "cpu"
 
-# Tentar importar rvc-python
+# ---------------------------------------------------------------------------
+# PyTorch
+# ---------------------------------------------------------------------------
+HAS_TORCH = False
 try:
-    from rvc_python.infer import RVCInference
-    HAS_RVC = True
-    print("[VoiceCloner] ✅ rvc-python encontrado — clonagem RVC disponível")
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    HAS_TORCH = True
 except ImportError:
-    print("[VoiceCloner] ⚠️  rvc-python não instalado — apenas efeitos simples")
-    print("  Para instalar: pip install rvc-python")
-    print("  Ou executa: python setup_rvc.py")
+    pass
 
 
-# ---------------------------------------------------------------------------
-# Modelo de Voz
-# ---------------------------------------------------------------------------
+# ===================================================================
+# HiFi-GAN Generator (arquitetura RVC v2)
+# ===================================================================
+class _ResBlock(nn.Module):
+    def __init__(self, ch, dilations):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.utils.weight_norm(nn.Conv1d(ch, ch, 3, dilation=d, padding=d))
+            for d in dilations
+        ])
+    def forward(self, x):
+        for c in self.convs:
+            x = c(F.leaky_relu(x, 0.1)) + x
+        return x
+
+
+class _Generator(nn.Module):
+    def __init__(self, h):
+        super().__init__()
+        self.h = h
+        self.n_ups = len(h.upsample_rates)
+        self.n_kernels = len(h.resblock_kernel_sizes)
+        self.conv_pre = nn.utils.weight_norm(
+            nn.Conv1d(h.initial_channel, h.upsample_initial_channel, 7, 1, 3))
+        self.ups = nn.ModuleList()
+        for i, (r, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
+            self.ups.append(nn.utils.weight_norm(nn.ConvTranspose1d(
+                h.upsample_initial_channel // (2**i),
+                h.upsample_initial_channel // (2**(i+1)),
+                k, r, padding=(k - r) // 2)))
+        self.resblocks = nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = h.upsample_initial_channel // (2**(i+1))
+            for k, d in enumerate(h.resblock_kernel_sizes):
+                self.resblocks.append(_ResBlock(ch, h.resblock_dilation_sizes[k]))
+        self.conv_post = nn.utils.weight_norm(nn.Conv1d(ch, 1, 7, 1, 3))
+
+    def forward(self, x):
+        x = self.conv_pre(x)
+        for i in range(self.n_ups):
+            x = F.leaky_relu(x, 0.1)
+            x = self.ups[i](x)
+            xs = sum(self.resblocks[i*self.n_kernels + j](x)
+                     for j in range(self.n_kernels))
+            x = xs / self.n_kernels
+        return torch.tanh(self.conv_post(F.leaky_relu(x)))
+
+
+class _HParams:
+    initial_channel = 256
+    resblock_kernel_sizes = [3, 7, 11]
+    resblock_dilation_sizes = [[1,3,5], [1,3,5], [1,3,5]]
+    upsample_rates = [8, 8, 2, 2, 2]
+    upsample_kernel_sizes = [16, 16, 4, 4, 4]
+    upsample_initial_channel = 512
+
+
+# ===================================================================
+# RVCModel — inferência pura com PyTorch
+# ===================================================================
+class RVCModel:
+    def __init__(self, pth_path: str):
+        self.device = torch.device(DEVICE if HAS_TORCH else "cpu")
+        self.pth_path = pth_path
+        self.gen: _Generator | None = None
+        self._proj: nn.Conv1d | None = None
+
+    def load(self) -> bool:
+        if not HAS_TORCH:
+            return False
+        try:
+            ckpt = torch.load(self.pth_path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"[RVC] Erro ao carregar: {e}")
+            return False
+
+        state = ckpt.get('model', ckpt.get('generator', ckpt.get('weight', ckpt)))
+        clean = OrderedDict()
+        for k, v in state.items():
+            for pfx in ['module.', 'generator.', 'dec.', 'net_g.']:
+                if k.startswith(pfx):
+                    k = k[len(pfx):]; break
+            clean[k] = v
+
+        h = _HParams()
+        for k, v in clean.items():
+            if 'conv_pre.weight' in k:
+                h.initial_channel = v.shape[1]
+                break
+
+        try:
+            self.gen = _Generator(h).to(self.device)
+            self.gen.load_state_dict(clean, strict=False)
+            self.gen.eval()
+            print(f"[RVC] OK: {Path(self.pth_path).stem} ({h.initial_channel}ch, {self.device})")
+            return True
+        except Exception as e:
+            print(f"[RVC] Arquitetura incompatível: {e}")
+            self.gen = None
+            return False
+
+    def infer(self, audio: np.ndarray) -> np.ndarray | None:
+        """audio (T,) float32 → (T,) float32"""
+        if self.gen is None:
+            return None
+        with torch.no_grad():
+            t = torch.from_numpy(audio).float().unsqueeze(0).to(self.device)
+            # Mel spectrogram como representação de conteúdo
+            mel = self._mel(t)  # (1, 128, frames)
+            # Upsample mel para o tamanho do áudio
+            up = F.interpolate(mel, size=t.shape[1], mode='linear',
+                               align_corners=False)
+            # Projetar para o canal de entrada do generator
+            if self._proj is None:
+                self._proj = nn.Conv1d(up.shape[1], self.gen.h.initial_channel, 1).to(self.device)
+                nn.init.xavier_uniform_(self._proj.weight)
+            x = self._proj(up)
+            out = self.gen(x)
+            return out.squeeze().cpu().numpy().astype(np.float32)
+
+    def _mel(self, audio: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, '_mel_t'):
+            import torchaudio
+            self._mel_t = torchaudio.transforms.MelSpectrogram(
+                sample_rate=RATE, n_fft=2048, hop_length=HOP,
+                n_mels=128, f_min=40, f_max=16000,
+            ).to(self.device)
+        return torch.log(torch.clamp(self._mel_t(audio), min=1e-5))
+
+
+# ===================================================================
+# VoiceCloner — API pública
+# ===================================================================
 class RVCVoiceModel:
-    """
-    Representa um modelo de voz RVC.
-    Aponta para ficheiros .pth (pesos) e .index (feature index).
-    """
-
-    def __init__(
-        self,
-        name: str,
-        pth_path: str | None = None,
-        index_path: str | None = None,
-        description: str = "",
-        sample_url: str = "",
-    ):
+    def __init__(self, name: str, pth_path: str | None = None,
+                 index_path: str | None = None, description: str = ""):
         self.name = name
         self.pth_path = Path(pth_path) if pth_path else None
         self.index_path = Path(index_path) if index_path else None
         self.description = description
-        self.sample_url = sample_url
 
     @property
     def is_valid(self) -> bool:
-        return (
-            self.pth_path is not None
-            and self.pth_path.exists()
-        )
-
-    def __repr__(self):
-        return f"RVCVoiceModel({self.name}, valid={self.is_valid})"
+        return self.pth_path is not None and self.pth_path.exists()
 
 
-# ---------------------------------------------------------------------------
-# Voice Cloner Principal
-# ---------------------------------------------------------------------------
 class VoiceCloner:
-    """
-    Clonador de voz em tempo real.
-
-    Uso:
-        cloner = VoiceCloner()
-        cloner.load_model("models/rvc/cantor_famoso")
-        cloner.start(input_device=0, output_device=1)
-
-        while True:
-            audio = capturar_audio()
-            voz_clonada = cloner.process_audio(audio)
-    """
-
     def __init__(self):
-        self._rvc: RVCInference | None = None
-        self._model: RVCVoiceModel | None = None
+        self._rvc: RVCModel | None = None
+        self._voice_model: RVCVoiceModel | None = None
         self._running = False
         self._lock = threading.Lock()
-
-        # Configurações
-        self.pitch_shift: int = 0        # -24 a +24 semitons
-        self.formant_shift: float = 0.0  # -1.0 a +1.0
-        self.volume: float = 1.0
-        self.use_rvc: bool = HAS_RVC
-
-        # Callback de saída
         self._output_callback: Callable | None = None
+        self._audio: object | None = None
+        self.pitch_shift: int = 0
+        self.volume: float = 1.0
 
-        # Cache para efeitos simples
-        self._simple_effects = self._SimpleEffects()
-
-    # ------------------------------------------------------------------
-    # Carregar modelo
-    # ------------------------------------------------------------------
+    # ─── Load ──────────────────────────────────────────────────────
     def load_model(self, model_path: str) -> bool:
-        """
-        Carrega um modelo RVC.
-        model_path: caminho base (sem extensão) — espera model_path.pth e model_path.index
-        """
         pth = Path(model_path + ".pth") if not model_path.endswith(".pth") else Path(model_path)
         index = Path(str(pth).replace(".pth", ".index"))
-
         if not pth.exists():
-            print(f"[VoiceCloner] ❌ Modelo não encontrado: {pth}")
-            print("  Coloca o ficheiro .pth em models/rvc/")
-            self.use_rvc = False
+            print(f"[VoiceCloner] Nao encontrado: {pth}")
             return False
-
-        self._model = RVCVoiceModel(
-            name=pth.stem,
-            pth_path=str(pth),
-            index_path=str(index) if index.exists() else None,
-        )
-
-        if HAS_RVC and self.use_rvc:
-            try:
-                self._rvc = RVCInference(
-                    model_path=str(pth),
-                    index_path=str(index) if index.exists() else None,
-                )
-                print(f"[VoiceCloner] ✅ Modelo carregado: {pth.stem}")
+        self._voice_model = RVCVoiceModel(
+            name=pth.stem, pth_path=str(pth),
+            index_path=str(index) if index.exists() else None)
+        if HAS_TORCH:
+            self._rvc = RVCModel(str(pth))
+            if self._rvc.load():
                 return True
-            except Exception as e:
-                print(f"[VoiceCloner] ❌ Erro ao carregar RVC: {e}")
-                print("  A usar fallback de efeitos simples...")
-                self.use_rvc = False
-                return False
-
+        print("[VoiceCloner] Usando efeitos de pitch como fallback.")
         return False
 
     def list_available_models(self) -> list[RVCVoiceModel]:
-        """Lista modelos RVC disponíveis na pasta models/rvc/."""
         models = []
-        rvc_dir = Path("models/rvc")
-        if rvc_dir.exists():
-            for pth in rvc_dir.glob("*.pth"):
-                index = pth.with_suffix(".index")
+        d = Path("models/rvc")
+        if d.exists():
+            for f in sorted(d.glob("*.pth")):
+                idx = f.with_suffix(".index")
                 models.append(RVCVoiceModel(
-                    name=pth.stem,
-                    pth_path=str(pth),
-                    index_path=str(index) if index.exists() else None,
-                ))
-        
-        # Adicionar modelos built-in (efeitos simples)
-        models.append(RVCVoiceModel(
-            name="🎤 Efeito: Voz Aguda",
-            description="Pitch shift +4 semitons",
-        ))
-        models.append(RVCVoiceModel(
-            name="🎤 Efeito: Voz Grave",
-            description="Pitch shift -4 semitons",
-        ))
-        models.append(RVCVoiceModel(
-            name="🤖 Efeito: Robô",
-            description="Quantização + sample & hold",
-        ))
+                    name=f.stem, pth_path=str(f),
+                    index_path=str(idx) if idx.exists() else None))
+        models.append(RVCVoiceModel(name="🎤 Agudo (+4 st)"))
+        models.append(RVCVoiceModel(name="🎤 Grave (-4 st)"))
+        models.append(RVCVoiceModel(name="🌊 Profundo (-12 st)"))
+        models.append(RVCVoiceModel(name="🐿 Chipmunk (+12 st)"))
         return models
 
-    # ------------------------------------------------------------------
-    # Processamento de Áudio
-    # ------------------------------------------------------------------
+    # ─── Process ───────────────────────────────────────────────────
     def process_audio(self, audio_int16: np.ndarray) -> np.ndarray:
-        """
-        Processa um chunk de áudio.
-        Se RVC estiver ativo, faz voice conversion.
-        Caso contrário, aplica efeitos simples.
-        """
-        if self._rvc is not None and self.use_rvc:
-            return self._process_rvc(audio_int16)
-        else:
-            return self._process_simple(audio_int16)
-
-    def _process_rvc(self, audio_int16: np.ndarray) -> np.ndarray:
-        """Conversão via RVC."""
+        f32 = audio_int16.astype(np.float32) / 32768.0
         with self._lock:
             rvc = self._rvc
-            pitch = self.pitch_shift
+            ps = self.pitch_shift
+        if rvc is not None:
+            try:
+                out = rvc.infer(f32)
+                if out is not None:
+                    out = out[:len(f32)] if len(out) > len(f32) else np.pad(out, (0, max(0, len(f32)-len(out))))
+                    return np.clip(out * 32767 * self.volume, -32768, 32767).astype(np.int16)
+            except Exception:
+                pass
+        # Fallback: pitch shift via librosa
+        if ps != 0:
+            try:
+                import librosa
+                f32 = librosa.effects.pitch_shift(
+                    f32.astype(np.float64), sr=RATE, n_steps=float(ps),
+                    bins_per_octave=24).astype(np.float32)
+            except Exception:
+                factor = 2.0 ** (ps / 12.0)
+                idx = np.arange(0, len(f32), factor).astype(int)
+                idx = idx[idx < len(f32)]
+                s = f32[idx]
+                if len(s) > 1:
+                    o = np.linspace(0, len(s)-1, len(s))
+                    n = np.linspace(0, len(s)-1, len(f32))
+                    f32 = np.interp(n, o, s).astype(np.float32)
+        return np.clip(f32 * 32767 * self.volume, -32768, 32767).astype(np.int16)
 
-        if rvc is None:
-            return audio_int16
-
-        try:
-            # Converter para float32 [-1, 1]
-            audio_float = audio_int16.astype(np.float32) / 32768.0
-
-            # RVC inference
-            result_float = rvc.infer(
-                audio_float,
-                sr=RATE,
-                pitch_shift=pitch,
-            )
-
-            # Voltar para int16
-            if result_float is not None:
-                result = np.clip(result_float * 32767, -32768, 32767).astype(np.int16)
-                # Ajustar tamanho se necessário
-                if len(result) < len(audio_int16):
-                    result = np.pad(result, (0, len(audio_int16) - len(result)))
-                elif len(result) > len(audio_int16):
-                    result = result[:len(audio_int16)]
-                return result
-
-        except Exception as e:
-            # Fallback silencioso para efeitos simples
-            pass
-
-        return audio_int16
-
-    def _process_simple(self, audio_int16: np.ndarray) -> np.ndarray:
-        """Efeitos simples como fallback."""
-        return self._simple_effects.process(audio_int16, self.pitch_shift)
-
-    # ------------------------------------------------------------------
-    # Iniciar / Parar stream
-    # ------------------------------------------------------------------
-    def start(
-        self,
-        input_device_index: int | None = None,
-        output_device_index: int | None = None,
-    ) -> bool:
-        """Inicia o stream de voz em tempo real."""
+    # ─── Stream ────────────────────────────────────────────────────
+    def start(self, input_device_index=None, output_device_index=None) -> bool:
         if self._running:
             return False
-
         import pyaudio
         self._audio = pyaudio.PyAudio()
         self._running = True
-
-        def audio_loop():
-            import pyaudio
-            try:
-                in_stream = self._audio.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=RATE,
-                    input=True,
-                    input_device_index=input_device_index,
-                    frames_per_buffer=CHUNK,
-                )
-            except Exception as e:
-                print(f"[VoiceCloner] Erro microfone: {e}")
-                self._running = False
-                return
-
-            out_stream = None
-            try:
-                out_stream = self._audio.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=RATE,
-                    output=True,
-                    output_device_index=output_device_index,
-                    frames_per_buffer=CHUNK,
-                )
-            except Exception:
-                pass  # Sem monitor
-
-            while self._running:
-                try:
-                    data = in_stream.read(CHUNK, exception_on_overflow=False)
-                except Exception:
-                    continue
-
-                audio_in = np.frombuffer(data, dtype=np.int16)
-                audio_out = self.process_audio(audio_in)
-
-                # Callback externo (gravação)
-                if self._output_callback:
-                    try:
-                        self._output_callback(audio_out)
-                    except Exception:
-                        pass
-
-                if out_stream:
-                    try:
-                        out_stream.write(audio_out.tobytes())
-                    except Exception:
-                        pass
-
-            in_stream.close()
-            if out_stream:
-                out_stream.close()
-
-        threading.Thread(target=audio_loop, daemon=True).start()
-        print(f"[VoiceCloner] ✅ Stream iniciado (RVC={'sim' if self._rvc else 'não'})")
+        threading.Thread(target=self._loop, args=(
+            input_device_index, output_device_index), daemon=True).start()
+        print("[VoiceCloner] Stream iniciado")
         return True
 
-    def stop(self) -> None:
-        """Para o stream."""
-        self._running = False
-        time.sleep(0.2)
+    def _loop(self, in_dev, out_dev):
+        import pyaudio
         try:
-            self._audio.terminate()
+            ins = self._audio.open(pyaudio.paInt16, 1, RATE, True,
+                                   input_device_index=in_dev,
+                                   frames_per_buffer=CHUNK)
+        except Exception as e:
+            print(f"[VoiceCloner] Erro mic: {e}"); self._running = False; return
+        outs = None
+        try:
+            outs = self._audio.open(pyaudio.paInt16, 1, RATE, False,
+                                    output_device_index=out_dev,
+                                    frames_per_buffer=CHUNK)
         except Exception:
             pass
+        while self._running:
+            try:
+                data = ins.read(CHUNK, exception_on_overflow=False)
+            except Exception:
+                continue
+            out = self.process_audio(np.frombuffer(data, dtype=np.int16))
+            if self._output_callback:
+                try: self._output_callback(out)
+                except Exception: pass
+            if outs:
+                try: outs.write(out.tobytes())
+                except Exception: pass
+        ins.close()
+        if outs: outs.close()
 
-    def set_output_callback(self, callback: Callable) -> None:
-        """Define callback que recebe cada chunk processado."""
-        self._output_callback = callback
+    def stop(self):
+        self._running = False
+        time.sleep(0.2)
+        try: self._audio.terminate()
+        except Exception: pass
 
-    # ------------------------------------------------------------------
-    # Classe interna de efeitos simples
-    # ------------------------------------------------------------------
-    class _SimpleEffects:
-        def __init__(self):
-            self._echo_buffer = np.zeros(0, dtype=np.float32)
+    def set_output_callback(self, cb):
+        self._output_callback = cb
 
-        def process(self, audio_int16: np.ndarray, pitch_semitones: int = 0) -> np.ndarray:
-            audio = audio_int16.astype(np.float32) / 32768.0
-
-            if abs(pitch_semitones) > 0:
-                audio = self._pitch_shift(audio, pitch_semitones)
-
-            return np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-
-        def _pitch_shift(self, audio: np.ndarray, semitones: float) -> np.ndarray:
-            if semitones == 0:
-                return audio
-            factor = 2.0 ** (semitones / 12.0)
-            indices = np.arange(0, len(audio), factor).astype(np.int32)
-            indices = indices[indices < len(audio)]
-            stretched = audio[indices]
-            if len(stretched) > 0:
-                old = np.linspace(0, len(stretched) - 1, len(stretched))
-                new = np.linspace(0, len(stretched) - 1, len(audio))
-                return np.interp(new, old, stretched).astype(np.float32)
-            return np.zeros_like(audio, dtype=np.float32)
-
-
-# ===================================================================
-# Funções utilitárias
-# ===================================================================
-def download_famous_voice_model(voice_name: str, output_dir: str = "models/rvc") -> bool:
-    """
-    Tenta encontrar e descarregar um modelo RVC de voz famosa.
-    
-    Vozes disponíveis (HuggingFace):
-      - "taylor_swift", "donald_trump", "morgan_freeman", "obama", etc.
-    
-    Requer huggingface_hub instalado.
-    """
-    try:
-        from huggingface_hub import hf_hub_download, list_repo_files
-    except ImportError:
-        print("[VoiceCloner] ⚠️  huggingface_hub não instalado.")
-        print("  pip install huggingface_hub")
-        print("\nAlternativa manual:")
-        print(f"  1. Procura modelos .pth em: https://huggingface.co/models?search=rvc+{voice_name}")
-        print(f"  2. Descarrega o .pth e .index para: {output_dir}/")
+    # ─── Download ──────────────────────────────────────────────────
+    def download_model(self, url: str, output_dir: str = "models/rvc") -> bool:
+        os.makedirs(output_dir, exist_ok=True)
+        if url.startswith("http"):
+            import urllib.request, zipfile
+            name = url.split("/")[-1].replace(".zip", "")
+            dest = os.path.join(output_dir, f"{name}.zip")
+            print(f"[VoiceCloner] Baixando: {url}")
+            try:
+                urllib.request.urlretrieve(url, dest)
+                with zipfile.ZipFile(dest, 'r') as zf:
+                    zf.extractall(os.path.join(output_dir, name))
+                for root, _, files in os.walk(os.path.join(output_dir, name)):
+                    for f in files:
+                        if f.endswith('.pth'):
+                            shutil.copy2(os.path.join(root, f),
+                                         os.path.join(output_dir, name + '.pth'))
+                        elif f.endswith('.index'):
+                            shutil.copy2(os.path.join(root, f),
+                                         os.path.join(output_dir, name + '.index'))
+                os.remove(dest)
+                print(f"[VoiceCloner] OK: {name}")
+                return True
+            except Exception as e:
+                print(f"[VoiceCloner] Erro: {e}")
+                return False
         return False
 
-    # Repositórios conhecidos de modelos RVC
-    known_repos = [
-        "therealvulcan/RVC-Voice-Conversion-Community-Models",
-        "lj1995/VoiceConversionWebUI",
-    ]
 
-    for repo in known_repos:
-        try:
-            files = list_repo_files(repo)
-            matching = [f for f in files if voice_name.lower() in f.lower() and f.endswith(".pth")]
-            if matching:
-                print(f"[VoiceCloner] 🔍 Encontrado: {matching[0]} em {repo}")
-                os.makedirs(output_dir, exist_ok=True)
-                pth_path = hf_hub_download(repo, matching[0], local_dir=output_dir)
-                print(f"[VoiceCloner] ✅ Descarregado: {pth_path}")
-                
-                # Procurar .index correspondente
-                index_file = matching[0].replace(".pth", ".index")
-                index_matches = [f for f in files if f == index_file]
-                if index_matches:
-                    idx_path = hf_hub_download(repo, index_file, local_dir=output_dir)
-                    print(f"[VoiceCloner] ✅ Index: {idx_path}")
-                
-                return True
-        except Exception:
-            continue
-
-    print(f"[VoiceCloner] ❌ Não encontrado modelo para '{voice_name}'")
-    print(f"  Procura manualmente em: https://huggingface.co/models?search=rvc+{voice_name}")
-    return False
+def download_famous_voice_model(voice_name: str, output_dir: str = "models/rvc") -> bool:
+    return VoiceCloner().download_model(voice_name, output_dir)
 
 
 # ===================================================================
-# Teste rápido
+# Teste
 # ===================================================================
 if __name__ == "__main__":
-    print("=== Voice Cloner - Teste ===\n")
-
-    cloner = VoiceCloner()
-    models = cloner.list_available_models()
-
-    print("Modelos disponíveis:")
+    print("=== Voice Cloner ===\n")
+    c = VoiceCloner()
+    models = c.list_available_models()
     for i, m in enumerate(models):
-        print(f"  [{i}] {m.name} {'✅' if m.is_valid else '🎤'}")
-
-    if HAS_RVC and models:
-        # Tentar carregar o primeiro modelo .pth
-        for m in models:
-            if m.is_valid:
-                print(f"\nCarregando: {m.name}...")
-                cloner.load_model(str(m.pth_path).replace(".pth", ""))
-                break
-        else:
-            print("\nNenhum modelo .pth encontrado em models/rvc/")
-            print("Usando efeitos simples como fallback.")
+        print(f"  [{i}] {'✅' if m.is_valid else '🎤'} {m.name}")
+    valid = [m for m in models if m.is_valid]
+    if valid:
+        c.load_model(str(valid[0].pth_path).replace(".pth", ""))
     else:
-        print("\nUsando efeitos simples (rvc-python não instalado).")
-        print("Para clonagem real: pip install rvc-python && python setup_rvc.py")
-
-    print("\nPressiona Ctrl+C para sair.")
+        c.pitch_shift = -4
+    print("\nCtrl+C para sair.")
+    c.start()
     try:
-        cloner.start()
-        while True:
-            time.sleep(0.1)
+        while True: time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\nA parar...")
-        cloner.stop()
+        print("\nParando..."); c.stop()
